@@ -10,6 +10,8 @@ metadata:
 
 Play Wordle against the agent. You and the agent take turns guessing a secret 5-letter word. Fewer attempts = winner.
 
+**Note:** This project now includes a standalone CLI game at `wordle_duel.py`. Run it directly with `python3 wordle_duel.py` for the full experience with difficulty levels, hints, and statistics.
+
 ## Rules
 
 1. Agent picks a secret 5-letter word (hidden from user)
