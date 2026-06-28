@@ -144,6 +144,56 @@ try:
 except py_compile.PyCompileError as e:
     check('No syntax errors', False, str(e))
 
+# --- Test 11: Daily word ---
+print()
+print('Test 11: Daily challenge')
+from wordle_duel import get_daily_word, get_daily_number
+
+dw = get_daily_word()
+check('Daily word is valid', is_valid_word(dw), str(dw))
+check('Daily word is 5 letters', len(dw) == 5)
+dn = get_daily_number()
+check('Daily number is int', isinstance(dn, int))
+check('Daily number > 0', dn > 0)
+
+# Check determinism
+dw2 = get_daily_word()
+check('Daily word is deterministic', dw == dw2)
+
+# --- Test 12: AI difficulty ---
+print()
+print('Test 12: AI difficulty levels')
+from wordle_duel import AI_DIFFICULTIES
+check('AI has easy', 'easy' in AI_DIFFICULTIES)
+check('AI has normal', 'normal' in AI_DIFFICULTIES)
+check('AI has hard', 'hard' in AI_DIFFICULTIES)
+
+# Test easy AI ignores constraints
+ai_easy = WordleAI(['crane', 'blame', 'trace', 'stare', 'brave'], difficulty='easy')
+g = ai_easy.guess()
+check('Easy AI returns word', g in ['crane', 'blame', 'trace', 'stare', 'brave'], str(g))
+
+# Test hard AI picks from candidates
+ai_hard = WordleAI(['crane', 'blame', 'trace', 'stare', 'brave'], difficulty='hard')
+ai_hard.learn('blame', evaluate_guess('crane', 'blame'))
+g = ai_hard.guess()
+check('Hard AI picks candidate', g in ai_hard.candidates, str(g))
+
+# --- Test 13: Daily state ---
+print()
+print('Test 13: Daily state persistence')
+from wordle_duel import load_daily_state, save_daily_state, check_daily_played, record_daily_result
+mock_daily = Path(tempfile.mktemp(suffix='.json'))
+with unittest.mock.patch('wordle_duel.DAILY_FILE', mock_daily):
+    ds = load_daily_state()
+    check('Empty daily state', ds['last_played'] is None)
+    check('Not played yet', check_daily_played() == False)
+    record_daily_result(guesses=3, won=True)
+    check('Played after record', check_daily_played() == True)
+    ds2 = load_daily_state()
+    check('Daily result saved', 'results' in ds2 and len(ds2['results']) > 0)
+    mock_daily.unlink(missing_ok=True)
+
 # --- Summary ---
 print()
 print('=' * 50)

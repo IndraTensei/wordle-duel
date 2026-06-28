@@ -6,19 +6,26 @@ A standalone CLI game where you and an AI take turns guessing
 a secret 5-letter word. Whoever guesses in fewer tries wins!
 
 Usage:
-    python wordle_duel.py           # Start a game (Normal difficulty)
-    python wordle_duel.py --easy    # Easy mode (8 guesses)
-    python wordle_duel.py --hard    # Hard mode (4 guesses)
-    python wordle_duel.py --stats   # View your lifetime statistics
-    python wordle_duel.py --reset   # Reset statistics
+    python wordle_duel.py              # Start a game (Normal difficulty)
+    python wordle_duel.py --easy       # Easy mode (8 guesses)
+    python wordle_duel.py --hard       # Hard mode (4 guesses)
+    python wordle_duel.py --blitz      # Blitz mode (30s per guess timer)
+    python wordle_duel.py --daily      # Daily challenge (same word for all)
+    python wordle_duel.py --ai easy    # Dumb AI opponent
+    python wordle_duel.py --ai hard    # Smart AI opponent
+    python wordle_duel.py --stats      # View your lifetime statistics
+    python wordle_duel.py --reset      # Reset statistics
 
 Features:
-    - 🟩🟨⬜ Color-coded feedback
-    - ⌨️  Live keyboard tracker
-    - 📊 Persistent statistics (win rate, streak, guess distribution)
-    - 💡 Hint system (reveal a correct letter)
-    - 🎮 Difficulty levels (Easy/Normal/Hard)
-    - 📖 Word definition reveal after each round
+    - Color-coded feedback (green/yellow/gray)
+    - Live keyboard tracker
+    - Persistent statistics (win rate, streak, guess distribution)
+    - Hint system (reveal a correct letter)
+    - Difficulty levels (Easy/Normal/Hard)
+    - Blitz mode (timed guesses, 30 seconds each)
+    - Daily challenge (deterministic word based on date)
+    - Adjustable AI difficulty (easy/normal/hard)
+    - Word definition reveal after each round
 """
 
 import json
@@ -27,7 +34,14 @@ import random
 import sys
 import textwrap
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+
+# Optional timer support for blitz mode
+try:
+    import signal
+    HAS_SIGNAL = True
+except ImportError:
+    HAS_SIGNAL = False
 
 # ---------------------------------------------------------------------------
 # Word list — common 5-letter English words
@@ -73,9 +87,34 @@ DIFFICULTIES = {
 }
 
 # ---------------------------------------------------------------------------
+# AI difficulty settings
+# ---------------------------------------------------------------------------
+AI_DIFFICULTIES = {
+    "easy":   {"label": "Easy AI (random guesses)",   "smartness": 0.0},
+    "normal": {"label": "Normal AI (learns from feedback)", "smartness": 0.7},
+    "hard":   {"label": "Hard AI (optimal solver)",    "smartness": 1.0},
+}
+
+# ---------------------------------------------------------------------------
+# Daily challenge
+# ---------------------------------------------------------------------------
+def get_daily_word() -> str:
+    """Return a deterministic word based on today's date (same for everyone)."""
+    today = date.today().toordinal()
+    index = today % len(WORD_LIST)
+    return WORD_LIST[index]
+
+
+def get_daily_number() -> int:
+    """Return the daily challenge number (days since epoch)."""
+    return date.today().toordinal()
+
+
+# ---------------------------------------------------------------------------
 # Statistics file
 # ---------------------------------------------------------------------------
 STATS_FILE = Path.home() / ".wordle_duel_stats.json"
+DAILY_FILE = Path.home() / ".wordle_duel_daily.json"
 
 
 def load_stats() -> dict:
@@ -250,7 +289,7 @@ def display_keyboard(letter_status: dict[str, str]):
 class WordleAI:
     """AI opponent that makes educated guesses."""
 
-    def __init__(self, word_list: list[str]):
+    def __init__(self, word_list: list[str], difficulty: str = "normal"):
         self.original_list = list(word_list)
         self.candidates = list(word_list)
         self.green: dict[int, str] = {}       # position -> letter
@@ -258,6 +297,7 @@ class WordleAI:
         self.yellow_all: set[str] = set()      # letters that must appear somewhere
         self.gray: set[str] = set()            # letters not in word
         self.guesses: list[str] = []
+        self.smartness = AI_DIFFICULTIES.get(difficulty, AI_DIFFICULTIES["normal"])["smartness"]
 
     def filter_candidates(self):
         """Narrow down candidates based on accumulated knowledge."""
@@ -333,7 +373,16 @@ class WordleAI:
         self.filter_candidates()
 
     def guess(self) -> str:
-        """Make a guess. Pick from candidates, preferring common-ish words."""
+        """Make a guess. Behavior depends on AI difficulty (smartness)."""
+        # Easy AI: random guess from full word list, ignoring constraints
+        if self.smartness == 0.0:
+            remaining = [w for w in self.original_list if w not in self.guesses]
+            if not remaining:
+                remaining = list(self.original_list)
+            choice = random.choice(remaining)
+            self.guesses.append(choice)
+            return choice
+
         if not self.candidates:
             # Fallback: pick any unused word from original list
             remaining = [w for w in self.original_list if w not in self.guesses]
@@ -347,7 +396,23 @@ class WordleAI:
         # Prefer candidates that haven't been guessed
         fresh = [w for w in self.candidates if w not in self.guesses]
         pool = fresh if fresh else self.candidates
-        choice = random.choice(pool)
+
+        # Normal AI: sometimes picks randomly from candidates
+        # Hard AI: always picks the best candidate (first in filtered list)
+        if self.smartness >= 1.0:
+            # Hard: pick the first candidate (most constrained = best info)
+            choice = pool[0]
+        elif random.random() < self.smartness:
+            # Normal: usually picks from candidates
+            choice = random.choice(pool)
+        else:
+            # Normal: occasionally picks a random word for variety
+            remaining = [w for w in self.original_list if w not in self.guesses]
+            if remaining:
+                choice = random.choice(remaining)
+            else:
+                choice = random.choice(pool)
+
         self.guesses.append(choice)
         return choice
 
@@ -375,14 +440,82 @@ def get_word_definition(word: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Timed input for blitz mode
+# ---------------------------------------------------------------------------
+class TimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError()
+
+
+def timed_input(prompt: str, timeout: int = 30) -> str:
+    """
+    Get input with a timeout. Returns empty string if time expires.
+    Falls back to regular input on platforms without signal.SIGALRM.
+    """
+    if not HAS_SIGNAL:
+        return input(prompt)
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)
+    try:
+        result = input(prompt)
+        signal.alarm(0)
+        return result
+    except TimeoutError:
+        print()
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Daily challenge tracking
+# ---------------------------------------------------------------------------
+def load_daily_state() -> dict:
+    """Load daily challenge state."""
+    if DAILY_FILE.exists():
+        try:
+            return json.loads(DAILY_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"last_played": None, "results": {}}
+
+
+def save_daily_state(state: dict):
+    """Save daily challenge state."""
+    DAILY_FILE.write_text(json.dumps(state, indent=2))
+
+
+def check_daily_played() -> bool:
+    """Check if today's daily challenge has been completed."""
+    state = load_daily_state()
+    today_str = date.today().strftime("%Y-%m-%d")
+    return today_str in state.get("results", {})
+
+
+def record_daily_result(guesses: int | None, won: bool):
+    """Record today's daily challenge result."""
+    state = load_daily_state()
+    today_str = date.today().strftime("%Y-%m-%d")
+    state["last_played"] = today_str
+    state["results"][today_str] = {
+        "guesses": guesses,
+        "won": won,
+        "number": get_daily_number(),
+    }
+    save_daily_state(state)
+
+
+# ---------------------------------------------------------------------------
 # Game round
 # ---------------------------------------------------------------------------
-def play_round(secret: str, difficulty: str, stats: dict) -> str:
+def play_round(secret: str, difficulty: str, stats: dict, blitz: bool = False, ai_difficulty: str = "normal") -> str:
     """
     Play one round. Returns 'player', 'ai', or 'draw'.
     """
     max_guesses = DIFFICULTIES[difficulty]["guesses"]
-    ai = WordleAI(WORD_LIST)
+    ai = WordleAI(WORD_LIST, difficulty=ai_difficulty)
 
     # Track letter statuses for keyboard
     letter_status: dict[str, str] = {}
@@ -392,10 +525,12 @@ def play_round(secret: str, difficulty: str, stats: dict) -> str:
     player_hints = 0
     max_hints = 1 if difficulty != "hard" else 0
 
-    print(f"\n🎯 I'm thinking of a 5-letter word...")
-    print(f"📏 Difficulty: {DIFFICULTIES[difficulty]['label']}")
-    print(f"💡 Hints available: {max_hints}")
-    print(f"📝 Type 'hint' for a hint, 'quit' to give up.\n")
+    blitz_label = " (BLITZ - 30s per guess!)" if blitz else ""
+    print(f"\nI'm thinking of a 5-letter word{blitz_label}...")
+    print(f"Difficulty: {DIFFICULTIES[difficulty]['label']}")
+    print(f"AI Opponent: {AI_DIFFICULTIES[ai_difficulty]['label']}")
+    print(f"Hints available: {max_hints}")
+    print(f"Type 'hint' for a hint, 'quit' to give up.\n")
 
     player_board: list[tuple[str, list[str]]] = []
     ai_board: list[tuple[str, list[str]]] = []
@@ -421,7 +556,14 @@ def play_round(secret: str, difficulty: str, stats: dict) -> str:
 
             remaining = max_guesses - player_guesses
             prompt = f"  Your guess ({remaining} left): "
-            raw = input(prompt).strip().lower()
+            if blitz:
+                raw = timed_input(prompt, timeout=30).strip().lower()
+                if raw == "":
+                    print("  Time's up! Skipping turn.\n")
+                    turn = 1
+                    continue
+            else:
+                raw = input(prompt).strip().lower()
 
             if raw == "quit":
                 print(f"\n🏳️  You gave up! The word was: {BOLD}{secret.upper()}{RESET}")
@@ -543,16 +685,124 @@ def print_board(player_board: list[tuple[str, list[str]]], ai_board: list[tuple[
 
 
 # ---------------------------------------------------------------------------
+# Daily challenge flow
+# ---------------------------------------------------------------------------
+def run_daily_challenge(stats: dict):
+    """Run the daily challenge and record the result."""
+    if check_daily_played():
+        today_str = date.today().strftime("%Y-%m-%d")
+        state = load_daily_state()
+        prev = state["results"][today_str]
+        print(f"\nYou've already completed today's daily challenge (#{prev['number']})!")
+        print(f"Result: {'Won' if prev['won'] else 'Lost'} in {prev['guesses'] if prev['guesses'] is not None else '?'} guesses.")
+        print("Come back tomorrow for a new word!\n")
+        return
+
+    secret = get_daily_word()
+    daily_num = get_daily_number()
+    print("\n" + "=" * 45)
+    print(f"  DAILY CHALLENGE #{daily_num}")
+    print(f"  {date.today().strftime('%A, %B %d, %Y')}")
+    print("=" * 45)
+    print("  Everyone gets the same word today!")
+    print(f"  You have 6 guesses. No hints. Good luck!\n")
+
+    player_board: list[tuple[str, list[str]]] = []
+    letter_status: dict[str, str] = {}
+    player_guesses = 0
+    max_guesses = 6
+
+    while player_guesses < max_guesses:
+        remaining = max_guesses - player_guesses
+        prompt = f"  Your guess ({remaining} left): "
+        raw = input(prompt).strip().lower()
+
+        if raw == "quit":
+            print(f"\n  The word was: {BOLD}{secret.upper()}{RESET}")
+            record_daily_result(guesses=None, won=False)
+            definition = get_word_definition(secret)
+            if definition:
+                print(f"  Definition: {definition}")
+            return
+
+        if len(raw) != 5 or not raw.isalpha():
+            print("  Please enter exactly 5 letters.\n")
+            continue
+
+        if raw not in WORD_LIST:
+            print("  Not in word list! Try again.\n")
+            continue
+
+        if raw in [g for g, _ in player_board]:
+            print("  You already guessed that word! Try another.\n")
+            continue
+
+        player_guesses += 1
+        statuses = evaluate_guess(secret, raw)
+        player_board.append((raw, statuses))
+
+        # Update keyboard
+        for letter, st in zip(raw, statuses):
+            current = letter_status.get(letter.upper(), "unknown")
+            priority = {"green": 0, "yellow": 1, "gray": 2, "unknown": 3}
+            if priority.get(st, 3) < priority.get(current, 3):
+                letter_status[letter.upper()] = st
+
+        colored = "".join(color_letter(l, s) for l, s in zip(raw, statuses))
+        emojis = emoji_feedback(statuses)
+        print(f"  {colored}  {emojis}")
+        display_keyboard(letter_status)
+
+        if raw == secret:
+            print(f"\n  Congratulations! You got it in {player_guesses} guess{'es' if player_guesses > 1 else ''}!")
+            print(f"  Daily Challenge #{daily_num} complete!")
+            record_daily_result(guesses=player_guesses, won=True)
+            definition = get_word_definition(secret)
+            if definition:
+                print(f"  Definition: {definition}")
+            print(f"\n  Share your result: Wordle Duel Daily #{daily_num} - {player_guesses}/6")
+            print()
+            return
+
+    # Out of guesses
+    print(f"\n  Out of guesses! The word was: {BOLD}{secret.upper()}{RESET}")
+    record_daily_result(guesses=max_guesses, won=False)
+    definition = get_word_definition(secret)
+    if definition:
+        print(f"  Definition: {definition}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main game loop
 # ---------------------------------------------------------------------------
 def main():
     # Parse args
     difficulty = "normal"
+    ai_difficulty = "normal"
+    blitz = False
+    daily = False
+
     if "--easy" in sys.argv:
         difficulty = "easy"
     elif "--hard" in sys.argv:
         difficulty = "hard"
-    elif "--stats" in sys.argv:
+
+    if "--blitz" in sys.argv:
+        blitz = True
+
+    if "--daily" in sys.argv:
+        daily = True
+
+    # Parse --ai flag
+    if "--ai" in sys.argv:
+        idx = sys.argv.index("--ai")
+        if idx + 1 < len(sys.argv):
+            ai_arg = sys.argv[idx + 1].lower()
+            if ai_arg in AI_DIFFICULTIES:
+                ai_difficulty = ai_arg
+
+    if "--stats" in sys.argv:
         display_stats(load_stats())
         return
     elif "--reset" in sys.argv:
@@ -563,21 +813,30 @@ def main():
         return
 
     stats = load_stats()
+
+    # Daily challenge mode
+    if daily:
+        run_daily_challenge(stats)
+        return
+
     used_words: list[str] = []
     score = {"player": 0, "ai": 0}
 
     print("\n" + "=" * 45)
-    print("🎯  W O R D L E   D U E L")
+    print("  W O R D L E   D U E L")
     print("=" * 45)
-    print("  You vs AI — who guesses the word first?")
+    print("  You vs AI -- who guesses the word first?")
     print(f"  Difficulty: {DIFFICULTIES[difficulty]['label']}")
+    print(f"  AI Opponent: {AI_DIFFICULTIES[ai_difficulty]['label']}")
+    if blitz:
+        print("  BLITZ MODE: 30 seconds per guess!")
     print("=" * 45)
 
     round_num = 0
     while True:
         round_num += 1
         print(f"\n{'─' * 45}")
-        print(f"  Round {round_num}  |  Score: You {score['player']} — {score['ai']} AI")
+        print(f"  Round {round_num}  |  Score: You {score['player']} -- {score['ai']} AI")
         print(f"{'─' * 45}")
 
         # Pick a secret word not yet used
@@ -588,7 +847,7 @@ def main():
         secret = random.choice(available)
         used_words.append(secret)
 
-        result = play_round(secret, difficulty, stats)
+        result = play_round(secret, difficulty, stats, blitz=blitz, ai_difficulty=ai_difficulty)
 
         # Update stats
         stats["games_played"] += 1
@@ -611,19 +870,19 @@ def main():
         save_stats(stats)
 
         # Ask to play again
-        print(f"\n📊 Score: You {score['player']} — {score['ai']} AI")
+        print(f"\nScore: You {score['player']} -- {score['ai']} AI")
         again = input("Play another round? (y/n): ").strip().lower()
         if again not in ("y", "yes"):
-            print(f"\n🏁 Final Score: You {score['player']} — {score['ai']} AI")
+            print(f"\nFinal Score: You {score['player']} -- {score['ai']} AI")
             if score["player"] > score["ai"]:
-                print("🎊 You won the match! Congratulations!")
+                print("You won the match! Congratulations!")
             elif score["ai"] > score["player"]:
-                print("🤖 AI wins the match! Better luck next time!")
+                print("AI wins the match! Better luck next time!")
             else:
-                print("🤝 It's a draw! Well played!")
-            print(f"\n📊 Lifetime stats: {stats['wins']}W / {stats['losses']}L / {stats['draws']}D")
+                print("It's a draw! Well played!")
+            print(f"\nLifetime stats: {stats['wins']}W / {stats['losses']}L / {stats['draws']}D")
             if stats["best_streak"] > 0:
-                print(f"🏆 Best win streak: {stats['best_streak']}")
+                print(f"Best win streak: {stats['best_streak']}")
             print()
             break
 
